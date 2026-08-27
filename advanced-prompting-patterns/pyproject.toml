@@ -1,23 +1,38 @@
 [project]
 name = "advanced-prompting-patterns"
 version = "0.1.0"
-description = "Add your description here"
+description = "Structured-output prompting patterns: schema validation, self-repair loops, and multi-step pipelines."
 readme = "README.md"
 authors = [
     { name = "ikahrilas", email = "ijk60068@gmail.com" }
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "datetime>=6.0",
     "openai>=3.3.1",
     "pydantic>=2.13.4",
     "python-dotenv>=1.2.3",
     "tiktoken>=0.14.0",
 ]
 
-[project.scripts]
-advanced-prompting-patterns = "advanced_prompting_patterns:main"
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.14",
+]
 
-[build-system]
-requires = ["uv_build>=0.12.5,<0.13.0"]
-build-backend = "uv_build"
+[tool.uv]
+# A collection of scripts, not an installable library.
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The modules under test live at the repo root rather than in a package.
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py312"
+extend-exclude = ["solution-files"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

@@ -1,34 +1,49 @@
+"""Helpers for turning a raw model response into a validated object."""
+
 import json
-from pydantic import ValidationError
+import re
 
-def extract_json(text: str):
-    """Extract the first JSON object from a string."""
-    text = text.strip()
+from pydantic import BaseModel, ValidationError
 
-    # Remove markdown code fences if present
-    if text.startswith("```"):
-        text = text.split("```", 2)[1]
-        text = text.split("\n", 1)[1] if "\n" in text else text
+_FENCE_RE = re.compile(r"^```[a-zA-Z]*\n|\n```$")
 
-    # Find the first opening brace and parse from there
+
+def extract_json(text: str) -> dict:
+    """Extract the first JSON object from a model response.
+
+    Handles the two things models routinely do even when told not to: wrapping
+    the JSON in a markdown code fence, and adding a sentence of preamble.
+
+    Raises:
+        json.JSONDecodeError: if no JSON object can be parsed from the text.
+    """
+    text = _FENCE_RE.sub("", text.strip()).strip()
+
     start = text.find("{")
-    if start == -1:
+    end = text.rfind("}")
+    if start == -1 or end <= start:
         raise json.JSONDecodeError("No JSON object found", text, 0)
 
-    return json.loads(text[start:])
+    data = json.loads(text[start : end + 1])
+    if not isinstance(data, dict):
+        raise json.JSONDecodeError("Expected a JSON object", text, start)
+    return data
 
-def validate_json_output(response_text, model_class):
-    """
-    Parse JSON from LLM response and validate against Pydantic model.
-    Returns (success, result_or_errors)
+
+def validate_json_output[M: BaseModel](
+    response_text: str, model_class: type[M]
+) -> tuple[bool, M | str]:
+    """Parse JSON from a model response and validate it against a schema.
+
+    Returns:
+        ``(True, instance)`` on success, or ``(False, error_message)`` on
+        failure. The error message is written to be fed straight back to the
+        model in a repair prompt.
     """
     try:
         data = extract_json(response_text)
-        validated = model_class(**data)
-        return True, validated
-
-    except json.JSONDecodeError as e:
-        return False, f"JSON parsing error: {e}"
-
-    except ValidationError as e:
-        return False, f"Validation errors: {e.errors()}"
+        return True, model_class.model_validate(data)
+    except json.JSONDecodeError as error:
+        return False, f"JSON parsing error: {error}"
+    except ValidationError as error:
+        return False, f"Validation errors: {error.errors()}"

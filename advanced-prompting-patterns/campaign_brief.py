@@ -1,10 +1,53 @@
-from conversation_manager import ConversationManager
+"""Generate validated marketing campaign briefs from product factsheets.
+
+Two strategies are implemented:
+
+* `generate_campaign_brief` - one prompt, factsheet straight to brief.
+* `generate_campaign_brief_pipeline` - extract facts first, then draft from the
+  validated extraction. Slower and more expensive, but more reliable on long or
+  messy factsheets, where a single prompt tends to drop details.
+
+Both funnel through `generate_validated`, which validates the response against a
+schema and feeds any errors back to the model as a repair prompt.
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+from typing import cast
+
+from pydantic import BaseModel
+
+from conversation_manager import ChatCompletionError, ConversationManager
+from models import CampaignBrief, ExtractedProductInfo
+from prompt_templates import (
+    build_campaign_prompt,
+    build_draft_prompt,
+    build_extract_prompt,
+    build_repair_prompt,
+)
 from utils import validate_json_output
-from models import CampaignGoal, CampaignBrief
 
-conversation = ConversationManager(max_tokens=5000)
+logger = logging.getLogger(__name__)
 
-factsheet = """
+DEFAULT_MAX_RETRIES = 3
+
+BRIEF_REMINDERS = """
+Remember:
+- campaign_goal must be exactly "awareness", "engagement", or "conversion"
+- All required fields must be present: campaign_name, target_audience,
+  key_message, campaign_goal, call_to_action, channel_recommendations
+- channel_recommendations must be a list of strings
+"""
+
+EXTRACT_REMINDERS = """
+Remember:
+- price_point must be exactly "budget", "mid-range", "premium", or "luxury"
+- Every list field must be a list of strings; use [] for scarcity_factors if none
+"""
+
+SIMPLE_FACTSHEET = """
 Product: Ethiopian Yirgacheffe Single-Origin Coffee
 Origin: Yirgacheffe region, Ethiopia
 Flavor Profile: Bright citrus notes, floral aroma, light body
@@ -13,122 +56,149 @@ Certifications: Fair Trade, Organic
 Price Point: Premium ($18.99/bag)
 """
 
-SYSTEM_PROMPT = """
-You are a marketing campaign strategist for GlobalJava Roasters,
-a premium coffee company focused on quality and sustainability.
+DETAILED_FACTSHEET = """
+Product: Limited Edition Geisha Reserve
+Origin: Hacienda La Esmeralda, Panama
+Altitude: 1,600-1,800 meters
+Processing: Natural, 72-hour fermentation
+Flavor Profile: Jasmine, bergamot, white peach, honey sweetness,
+silky body, complex finish with hints of tropical fruit
+Certifications: Single Estate, Competition Grade
+Limited Production: Only 500 bags produced this season
+Story: This micro-lot scored 94.1 points in the 2024 Cup of Excellence
+competition. The beans come from 30-year-old Geisha trees grown in
+volcanic soil. The extended fermentation process was developed
+specifically for this lot to enhance the floral characteristics.
+Price: $89.99/bag
+Previous Customer Feedback: "Best coffee I've ever tasted" - Coffee
+Review Magazine. Sold out in 3 days last year.
 """
 
-TASK = """
-Create a marketing campaign brief for the product described in the
-reference section below.
-"""
 
-CONSTRAINTS = """
-Follow these rules strictly:
-- Base all claims on information in the reference section
-- Use professional but engaging language
-- Focus on the product's unique characteristics
-- Recommend channels appropriate for premium coffee consumers
-"""
+class GenerationError(RuntimeError):
+    """Raised when the model never produced output matching the schema."""
 
-REFERENCE = f"""
-Product Information:
-{factsheet}
-"""
 
-OUTPUT_FORMAT = """
-Output your response as valid JSON with this exact structure:
+def generate_validated[M: BaseModel](
+    prompt: str,
+    schema: type[M],
+    conversation: ConversationManager | None = None,
+    reminders: str = "",
+    max_retries: int = DEFAULT_MAX_RETRIES,
+) -> M:
+    """Prompt the model until its JSON validates against `schema`.
 
-{{
-  "campaign_name": "string",
-  "target_audience": "string",
-  "key_message": "string",
-  "campaign_goal": "awareness" | "engagement" | "conversion",
-  "call_to_action": "string",
-  "channel_recommendations": ["string", "string", ...]
-}}
+    Each failed attempt is fed back to the model as a repair prompt describing
+    the validation errors. Because the conversation carries its own history, the
+    model sees its previous attempt alongside the correction.
 
-Respond with JSON only. No explanations or markdown formatting. Keep each string value to 1–2 sentences max.
-"""
+    Args:
+        prompt: The initial prompt.
+        schema: The Pydantic model the response must satisfy.
+        conversation: Conversation to use. A fresh one is created if omitted.
+        reminders: Extra schema-specific guidance included in repair prompts.
+        max_retries: Number of repair attempts after the first response.
 
-def build_campaign_prompt(factsheet):
-    """Compose a structured prompt from reusable blocks."""
-    return f"""
-{SYSTEM_PROMPT}
+    Raises:
+        GenerationError: if no attempt produced valid output.
+        ChatCompletionError: if the API call itself fails.
+    """
+    conversation = conversation or ConversationManager()
 
-{TASK}
-
-{CONSTRAINTS}
-
-{REFERENCE}
-
-{OUTPUT_FORMAT}
-""".strip()
-
-def generate_campaign_brief(factsheet, max_retries=3):
-    """Generate a validated campaign brief with automatic repair."""
-
-    conversation = ConversationManager()
-
-    initial_prompt = build_campaign_prompt(factsheet=factsheet)
-
-    response = conversation.chat_completion(initial_prompt)
-    print("Initial response:")
-    print(response)
-    print()
-
-    success, result = validate_json_output(response, CampaignBrief)
-
-    # If valid on first try, return it
+    response = conversation.chat_completion(prompt)
+    success, result = validate_json_output(response, schema)
     if success:
-        print("✓ Valid on first attempt!")
-        return result
+        logger.info("%s valid on first attempt.", schema.__name__)
+        return cast(M, result)
 
-    # Otherwise, try to repair
-    print(f"✗ Validation failed: {result}")
-    print()
+    last_error = result
+    for attempt in range(1, max_retries + 1):
+        logger.info("Attempting repair %d/%d: %s", attempt, max_retries, last_error)
 
-    retries = 0
-    while retries < max_retries:
-        print(f"Attempting repair {retries + 1}/{max_retries}...")
-
-        repair_prompt = f"""
-             The JSON you provided had validation errors:
-             
-             {result}
-             
-             Please provide corrected JSON that fixes these errors. Remember:
-             - campaign_goal must be exactly "awareness", "engagement", or "conversion"
-             - All required fields must be present: campaign_name, target_audience, key_message, campaign_goal, call_to_action, channel_recommendations
-             - channel_recommendations must be a list of strings
-             
-             Respond with valid JSON only. Keep each string value to 1–2 sentences max.
-        """
-
-        response = conversation.chat_completion(repair_prompt)
-        print("Repair response:")
-        print(response)
-        print()
-
-        success, result = validate_json_output(response, CampaignBrief)
-
+        response = conversation.chat_completion(
+            build_repair_prompt(last_error, reminders)
+        )
+        success, result = validate_json_output(response, schema)
         if success:
-            print("✓ Repair successful!")
-            return result
+            logger.info("Repair succeeded on attempt %d.", attempt)
+            return cast(M, result)
 
-        print(f"✗ Still invalid: {result}")
-        print()
-        retries += 1
+        last_error = result
 
-    # If we exhausted retries, raise an error
-    raise ValueError(f"Could not generate valid campaign brief after {max_retries} attempts. Last error: {result}")
+    raise GenerationError(
+        f"Could not produce a valid {schema.__name__} after {max_retries} "
+        f"repair attempts. Last error: {last_error}"
+    )
 
-try:
-    brief = generate_campaign_brief(factsheet)
-    print("✓ Generated valid campaign brief!")
-    print(f"Campaign: {brief.campaign_name}")
-    print(f"Target: {brief.target_audience}")
-    print(f"Goal: {brief.campaign_goal.value}")
-    print(f"Channels: {', '.join(brief.channel_recommendations)}")
-except ValueError as e:
-    print(f"✗ Failed to generate brief: {e}")
+
+def extract_product_info(
+    factsheet: str, max_retries: int = DEFAULT_MAX_RETRIES
+) -> ExtractedProductInfo:
+    """Pull structured, marketing-relevant facts out of a raw factsheet."""
+    return generate_validated(
+        build_extract_prompt(factsheet),
+        ExtractedProductInfo,
+        reminders=EXTRACT_REMINDERS,
+        max_retries=max_retries,
+    )
+
+
+def generate_campaign_brief(
+    factsheet: str, max_retries: int = DEFAULT_MAX_RETRIES
+) -> CampaignBrief:
+    """Generate a brief directly from a factsheet in a single step."""
+    return generate_validated(
+        build_campaign_prompt(factsheet),
+        CampaignBrief,
+        reminders=BRIEF_REMINDERS,
+        max_retries=max_retries,
+    )
+
+
+def generate_campaign_brief_pipeline(
+    factsheet: str, max_retries: int = DEFAULT_MAX_RETRIES
+) -> CampaignBrief:
+    """Generate a brief in two steps: extract facts, then draft from them."""
+    logger.info("Step 1: extracting product information.")
+    extracted = extract_product_info(factsheet, max_retries)
+    logger.info("Extracted info for: %s", extracted.product_name)
+
+    logger.info("Step 2: drafting campaign brief.")
+    return generate_validated(
+        build_draft_prompt(extracted),
+        CampaignBrief,
+        reminders=BRIEF_REMINDERS,
+        max_retries=max_retries,
+    )
+
+
+def format_brief(brief: CampaignBrief) -> str:
+    """Render a brief as readable console output."""
+    return "\n".join(
+        [
+            f"Campaign: {brief.campaign_name}",
+            f"Target:   {brief.target_audience}",
+            f"Goal:     {brief.campaign_goal.value}",
+            f"Message:  {brief.key_message}",
+            f"CTA:      {brief.call_to_action}",
+            f"Channels: {', '.join(brief.channel_recommendations)}",
+        ]
+    )
+
+
+def main() -> int:
+    """Run the pipeline on the sample factsheet. Returns a process exit code."""
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    try:
+        brief = generate_campaign_brief_pipeline(DETAILED_FACTSHEET)
+    except (GenerationError, ChatCompletionError) as error:
+        logger.error("Failed to generate brief: %s", error)
+        return 1
+
+    print(format_brief(brief))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
