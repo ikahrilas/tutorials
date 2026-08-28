@@ -9,7 +9,7 @@ load_dotenv()
 
 DEFAULT_API_KEY = os.environ.get("OPENAI_API_KEY")
 DEFAULT_MODEL = "gpt-5.6-luna" # Link to models: https://developers.openai.com/api/docs/models
-DEFAULT_TEMPERATURE = 0.7
+DEFAULT_TEMPERATURE = 1
 DEFAULT_MAX_TOKENS = 350
 DEFAULT_TOKEN_BUDGET = 4096
 
@@ -22,8 +22,6 @@ class ConversationManager:
                     "DEFAULT_API_KEY environment variable is not set. "
                     "Please set it or pass an api_key directly to ConversationManager."
                 )
-        if not base_url:
-            base_url = DEFAULT_BASE_URL
             
         self.client = OpenAI(
             api_key=api_key,
@@ -119,5 +117,3 @@ class ConversationManager:
     
     def reset_conversation_history(self):
         self.conversation_history = [{"role": "system", "content": self.get_system_message()}]
-
-        
